@@ -19,9 +19,11 @@ class Preprocessor:
         self.add_label()
         
         self.y = self.data.loc[:, self.label_]
-        self.X = self.data.loc[:, [x for x in self.features_list_ if x != "full_count"]]
+        self.X = self.data.loc[:, [x for x in self.features_list_ if x != "full_count"] + ["person_id"]]
         if "full_count" in self.features_list_ :
             self.X["full_count"] = self.X.apply(lambda x: x.count(), axis=1)
+        
+        self.X = self.X.set_index("person_id")
         
     def split(self, test_size=0.20, shuffle=True, random_state=42):
         if test_size == 0.:
@@ -48,7 +50,6 @@ class Preprocessor:
             self.imputer.fit_transform(self.fitted_data)
         else:
             self.fitted_data = self.fitted_data.dropna()
-        self.fitted_labels = labels.loc[self.fitted_data.index]
             
         
         self.scaler = scaler
@@ -57,11 +58,12 @@ class Preprocessor:
                 
     def transform(self, data):
         self.transformed_data = data.loc[:, self.features_list_]
+        self.index = self.transformed_data.index
         if self.imputer:
             self.transformed_data = self.imputer.transform(data)
             self.transformed_data = pd.DataFrame(
                 self.transformed_data, columns=self.features_list_
-            )
+            ).set_index(self.index)
         else:
             self.transformed_data = data.dropna()
         
@@ -85,7 +87,7 @@ class Preprocessor:
             self.transformed_data = self.scaler.transform(self.transformed_data)
             self.transformed_data = pd.DataFrame(
                 self.transformed_data, columns=self.features_list_
-            )
+            ).set_index(self.index)
         return self.transformed_data
             
     def fit_transform(self, data, labels, scaler=None, imputing_strategy=None, fill_value=None):
@@ -102,7 +104,7 @@ class Preprocessor:
         
     def plot_dist_label(self, data=None, label=None, figsize=None, nrow=None, ncol=3, height=5):
         if data is None:
-            data = pd.concat([self.X, self.y], axis=1)
+            data = pd.concat([self.X.reset_index(), self.y], axis=1)
         if label is None:
             label = self.label_
         if figsize is None:
@@ -113,7 +115,7 @@ class Preprocessor:
         for i, feature in enumerate(self.features_list_):
             self.distplot_with_hue(
                 data, feature, label, height=height, 
-                hist=False, kde=True, ax=ax[int(i/ncol),i%ncol]
+                ax=ax[int(i/ncol),i%ncol]
             )
             plt.close(2)
     
@@ -146,6 +148,7 @@ class Preprocessor:
             
     def distplot_with_hue(self, data=None, x=None, hue=None, row=None, col=None, 
                           height=None, aspect=1, legend=True, **kwargs):
-        _, bins = np.histogram(data[x].dropna())
+#         _, bins = np.histogram(data.loc[:, x].dropna().astype(np.float32))
+        data.loc[:, x] = data.loc[:, x].astype(np.float32)
         g = sns.FacetGrid(data, hue=hue, row=row, col=col, height=height, aspect=aspect)
-        g.map(sns.distplot, x, **kwargs)
+        g.map(sns.kdeplot, x, **kwargs)

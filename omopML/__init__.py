@@ -1,4 +1,4 @@
 from .loading import DataLoader
 from .preprocessing import Preprocessor
-from .evaluating import ModelEvaluator
+from .training import SingleLabelTrainer
 from .explorating import *

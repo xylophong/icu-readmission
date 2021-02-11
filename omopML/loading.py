@@ -3,8 +3,9 @@ from pyspark.sql.functions import col, concat, when, first, rank, isnull, lit, c
 from pyspark.sql.window import Window
 
 class DataLoader:
-    def __init__(self, database, tables_dict, measurements=None, at_admission=False):
+    def __init__(self, database, omop_ver, tables_dict, measurements=None, at_admission=False):
         self.database = database
+        self.omop_ver = omop_ver
         self.tables_list = list(tables_dict.keys())
         self.tables_dict = tables_dict
         self.at_admission = at_admission
@@ -14,8 +15,15 @@ class DataLoader:
     
     def load(self, sqlContext):
         for table in self.tables_list:
+            if self.database == "edsomop":
+                if table == "measurement":
+                    table_name = "glims_measurement_labs"
+                else:
+                    table_name = "orbis_" + table
+            else:
+                table_name = table
             self.loaded_tables[table] = (
-                sqlContext.sql("select * from " + self.database + ".{}".format(table))
+                sqlContext.sql("select * from " + self.database + ".{}".format(table_name))
             )
             
     def filter(self, conditions):
@@ -60,8 +68,10 @@ class DataLoader:
                     .where(col("measurement_concept_id").isin(list(self.measurements.values())))
             )
             
-    def create_dataset(self):
+    def create_dataset(self, sqlContext):
         for table in self.tables_dict:
+#             if (self.omop_ver == "6.0" and table == "person"):
+#                 self.tables_dict[table].append("death_datetime")
             self.tables_to_join[table] = self.loaded_tables[table].select(self.tables_dict[table])
             
         self.tables_to_join["history_aids"] = (
@@ -155,28 +165,56 @@ class DataLoader:
                 .drop_duplicates()
         )
         
-        self.tables_to_join["icu_stays"] = (
-            self.tables_to_join["visit_occurrence"]
-                .join(
-                    self.tables_to_join["visit_detail"],
-                    how="left",
-                    on="visit_occurrence_id"
-                )
-                .where(
-                    (col("visit_detail_concept_id") == 32037)
-                    & (col("visit_type_concept_id") == 2000000006)
-                )
-                .select(
-                    col("person_id"),
-                    col("visit_occurrence_id"),
-                    col("visit_detail_id"),
-                    col("visit_detail_concept_id"),
-                    col("visit_start_date"),
-                    col("visit_end_date"),
-                    col("discharge_to_concept_id")
-                )
-            
-        )
+        if self.database == "mimicomop":
+            self.tables_to_join["icu_stays"] = (
+                self.tables_to_join["visit_occurrence"]
+                    .join(
+                        self.tables_to_join["visit_detail"],
+                        how="left",
+                        on="visit_occurrence_id"
+                    )
+                    .where(
+                        (col("visit_detail_concept_id") == 32037)
+                        & (col("visit_type_concept_id") == 2000000006)
+                    )
+                    .select(
+                        col("person_id"),
+                        col("visit_occurrence_id"),
+                        col("visit_detail_id"),
+                        col("visit_detail_concept_id"),
+                        col("visit_start_date"),
+                        col("visit_end_date"),
+                        col("discharge_to_concept_id")
+                    )
+
+            )
+        else:
+            self.tables_to_join["icu_stays"] = (
+                self.tables_to_join["visit_occurrence"]
+                    .join(
+                        self.tables_to_join["visit_detail"],
+                        how="left",
+                        on="visit_occurrence_id"
+                    )
+                    .join(
+                        self.tables_to_join["care_site"].where(
+                            F.lower(F.col("care_site_name")).like("% rea %")
+                            | F.lower(F.col("care_site_name")).like("%reanimation%")
+                        ),
+                        how="inner",
+                        on="care_site_id"
+                    )
+                    .select(
+                        col("person_id"),
+                        col("visit_occurrence_id"),
+                        col("visit_detail_id"),
+                        col("visit_detail_concept_id"),
+                        col("visit_start_date"),
+                        col("visit_end_date"),
+                        col("discharge_to_concept_id")
+                    )
+
+            )
             
         window_asc = (
             Window.partitionBy(
@@ -246,11 +284,6 @@ class DataLoader:
                 on="person_id"
             )
             .join(
-                self.tables_to_join["death"], 
-                how="left",
-                on="person_id"
-            )
-            .join(
                 self.tables_to_join["preceding_surgery"], 
                 how="left",
                 on="visit_occurrence_id"
@@ -285,6 +318,16 @@ class DataLoader:
                 on="visit_occurrence_id"
             )
         )
+        self.add_deathdate(sqlContext)
+    
+    def add_deathdate(self, sqlContext):
+        if self.omop_ver == "5.3.1":
+            self.tables_to_join["death"] = sqlContext.sql(f"select * from {self.database}.death")
+            self.dataset = self.dataset.join(
+                self.tables_to_join["death"], 
+                how="left",
+                on="person_id"
+            )
         
     def rename_columns(self, df, columns):
         if isinstance(columns, dict):
