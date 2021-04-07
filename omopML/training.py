@@ -159,6 +159,9 @@ class SingleLabelTrainer:
         self.threshold = self.compute_threshold_f_beta(
             "f-beta", self.beta, self.y_val, self.val_probas
         )
+        
+    def std_err(self, metric, N):
+        return np.sqrt(metric * (1 - metric) / N)
 
     def evaluate(self, y_true, y_probas, cv=None, print_results=False):
         """
@@ -182,20 +185,29 @@ class SingleLabelTrainer:
 
         self.metrics = {}
         self.metrics["Precision"] = precision_score(y_true, y_pred.event)
+        self.metrics["Positive predictive value"] = self.ppv_score(y_true, y_probas)
+        self.metrics["Negative predictive value"] = self.npv_score(y_true, y_probas)
         self.metrics["Sensitivity/Recall"] = recall_score(y_true, y_pred.event)
         self.metrics["Specificity"] = recall_score(1 - y_true, 1 - y_pred.event)
         self.metrics["F1 score"] = f1_score(y_true, y_pred.event)
         self.metrics["ROC AUC"] = roc_auc_score(y_true, y_probas.event)
         self.metrics["Accuracy"] = accuracy_score(y_true, y_pred.event)
+        
+        for metric in self.metrics:
+            score = self.metrics[metric]
+            std_err = self.std_err(score, len(y_true))
+            self.metrics[metric] = f"{round(score, 3)} [{round(score - 1.96 * std_err, 3)}; {round(score + 1.96 * std_err, 3)}]"
 
         if print_results:
             for score in self.metrics:
-                print(f"{score}: {round(self.metrics[score], 4)}")
+                print(f"{score}: {self.metrics[score]}")
 
         if cv != None:
             custom_scorer = {
                 "Accuracy": make_scorer(self.accuracy_score, needs_proba=True),
                 "Precision": make_scorer(self.precision_score, needs_proba=True),
+                "Positive predictive value": make_scorer(self.ppv_score, needs_proba=True),
+                "Negative predictive value": make_scorer(self.npv_score, needs_proba=True),
                 "Sensitivity/Recall": make_scorer(self.recall_score, needs_proba=True),
                 "Specificity": make_scorer(self.specificity_score, needs_proba=True),
                 "F1 score": make_scorer(self.f1_score, needs_proba=True),
@@ -231,6 +243,22 @@ class SingleLabelTrainer:
     def f1_score(self, y_true, y_probas):
         y_pred = y_probas >= self.threshold
         return f1_score(y_true, y_pred)
+    
+    def ppv_score(self, y_true, y_probas):
+        y_pred = y_probas >= self.threshold
+        se = recall_score(y_true, y_pred)
+        sp = recall_score(1 - y_true, 1 - y_pred)
+        prev = sum(y_true) / len(y_true)
+        vpp = (se * prev) / ((se * prev) + (1 - sp) * (1 - prev))
+        return vpp
+    
+    def npv_score(self, y_true, y_probas):
+        y_pred = y_probas >= self.threshold
+        se = recall_score(y_true, y_pred)
+        sp = recall_score(1 - y_true, 1 - y_pred)
+        prev = sum(y_true) / len(y_true)
+        npv = (sp * (1 - prev)) / ((1 - se) * prev + sp * (1 - prev))
+        return npv
 
     def TensorBoardCallback(self, log_dir=None):
         writer = SummaryWriter(log_dir)
@@ -295,25 +323,34 @@ class SingleLabelTrainer:
     def plot_interactive_threshold(self, y_true, y_probas, width=700, height=500):
         fpr, tpr, thresh_roc = roc_curve(y_true, y_probas)
         pre, rec, thresh_pr = precision_recall_curve(y_true, y_probas)
+        
         df_roc = pd.DataFrame(
-            {"Specificity": 1 - fpr, "Sensitivity/Recall": tpr}, index=thresh_roc
+            {"Specificity": 1 - fpr, "Sensitivity": tpr}, index=thresh_roc
         )
         df_pr = pd.DataFrame(
-            {"Precision": pre[:-1], "Sensitivity/Recall": rec[:-1]}, index=thresh_pr
+            {"Positive predictive value": pre[:-1], "Sensitivity": rec[:-1]}, index=thresh_pr
         )
+        
         df = df_roc.merge(
             df_pr,
-            on="Sensitivity/Recall",
+            on="Sensitivity",
             how="inner",
             left_index=True,
             right_index=True,
         )
-        df.index.name = "Thresholds"
+        
+        prev = sum(y_true) / len(y_true)
+        df.loc[:, "Negative predictive value"] = (
+            (df.loc[:, "Specificity"] * (1 - prev)) 
+            / ((1 - df.loc[:, "Sensitivity"]) * prev + df.loc[:, "Specificity"] * (1 - prev))
+        )
+        
+        df.index.name = "Threshold"
         df.columns.name = "Metric"
         fig_thresh = px.line(
             df,
-            title="Sensitivity, Specificity and Precision trade-offs",
-            labels={"value": "Performance"},
+#             title="Metrics trade-offs according to classification thresholds",
+            labels={"value": "Metric values"},
             width=width,
             height=height,
             template="plotly_white",
@@ -355,10 +392,12 @@ class SingleLabelTrainer:
 
         # reference line, legends, and axis labels
         line = mlines.Line2D([0, 1], [0, 1], color='black')
-        transform = ax.transAxes
-        line.set_transform(transform)
+#         transform = ax.transAxes
+#         line.set_transform(transform)
         ax.add_line(line)
-        ax.set_title('Calibration plot (realiability curve)', fontsize=16)
-        ax.set_xlabel('Predicted probability', fontsize=16)
-        ax.set_ylabel('Outcome proportion', fontsize=16)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+#         ax.set_title('Calibration plot (realiability curve)', fontsize=16, fontweight="bold")
+        ax.set_xlabel('Predicted readmission rate', fontsize=16)
+        ax.set_ylabel('Observed readmission rate', fontsize=16)
         plt.legend(fontsize=16)

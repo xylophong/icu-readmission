@@ -1,6 +1,9 @@
 import pyspark.sql.functions as F
 from pyspark.sql.functions import col, concat, when, first, rank, isnull, lit, coalesce, asc, desc
 from pyspark.sql.window import Window
+from pandas.core.common import flatten
+from itertools import chain
+import numpy as np
 
 class DataLoader:
     def __init__(self, database, omop_ver, tables_dict, measurements=None, at_admission=False):
@@ -10,6 +13,13 @@ class DataLoader:
         self.tables_dict = tables_dict
         self.at_admission = at_admission
         self.measurements = measurements
+        self.measurements_map = {
+            y: np.array(
+                list(self.measurements.keys())
+            )[
+                [y in flatten([x]) for x in list(self.measurements.values())]
+            ][0] for y in list(flatten(self.measurements.values()))
+        }
         self.loaded_tables = {}
         self.tables_to_join = {}
     
@@ -17,14 +27,32 @@ class DataLoader:
         for table in self.tables_list:
             if self.database == "edsomop":
                 if table == "measurement":
-                    table_name = "glims_measurement_labs"
+                    self.measurement_col = "measurement_source_concept_id"
+                    self.loaded_tables[table] = (
+                        sqlContext.sql("select * from " + self.database + ".glims_measurement_labs")
+                        .drop(
+                            *[
+                                'row_status_concept_id', 
+                                'row_status_source_concept_id', 
+                                'row_status_source_value', 
+                                'value_as_concept_source_value'
+                            ]
+                        )
+                        .unionByName(
+                            sqlContext.sql("select * from " + self.database + ".orbis_measurement_physio")
+                        )
+                    )
                 else:
                     table_name = "orbis_" + table
+                    self.loaded_tables[table] = (
+                        sqlContext.sql("select * from " + self.database + ".{}".format(table_name))
+                    )
             else:
+                self.measurement_col = "measurement_concept_id"
                 table_name = table
-            self.loaded_tables[table] = (
-                sqlContext.sql("select * from " + self.database + ".{}".format(table_name))
-            )
+                self.loaded_tables[table] = (
+                    sqlContext.sql("select * from " + self.database + ".{}".format(table_name))
+                )
             
     def filter(self, conditions):
         if "gender_concept_id" in conditions:
@@ -63,10 +91,22 @@ class DataLoader:
                     .where(col("visit_detail_concept_id").isin(conditions["visit_detail_concept_id"]))
             )
         if self.measurements:
+            
+            mapping_expr = F.create_map([F.lit(x) for x in chain(*self.measurements_map.items())])
+            
             self.loaded_tables["measurement"] = (
                 self.loaded_tables["measurement"]
-                    .where(col("measurement_concept_id").isin(list(self.measurements.values())))
+                    .where(
+                        col(self.measurement_col).isin(
+                            list(self.measurements_map.keys())
+                        )
+                    )
+                    .withColumn(
+                        "measurement_name", mapping_expr.getItem(F.col(self.measurement_col))
+                    )
             )
+            self.tables_dict["measurement"].append("measurement_name")
+            
             
     def create_dataset(self, sqlContext):
         for table in self.tables_dict:
@@ -248,11 +288,11 @@ class DataLoader:
             .select('*', rank().over(window_asc).alias('rank'))
             .filter(col('rank') == 1)
             .groupBy("visit_occurrence_id")
-            .pivot("measurement_concept_id", list(self.measurements.values()))
+            .pivot("measurement_name", list(self.measurements.keys()))
             .agg(first("value_as_number", ignorenulls=True))
         )
         self.pivot_measures_asc = self.rename_columns(
-            self.pivot_measures_asc, {str(v): str("first_" + k) for k, v in self.measurements.items()}
+            self.pivot_measures_asc, {str(k): str("first_" + k) for k in self.measurements.keys()}
         )
         
         self.pivot_measures_desc = (
@@ -269,11 +309,11 @@ class DataLoader:
             .select('*', rank().over(window_desc).alias('rank'))
             .filter(col('rank') == 1)
             .groupBy("visit_occurrence_id")
-            .pivot("measurement_concept_id", list(self.measurements.values()))
+            .pivot("measurement_name", list(self.measurements.keys()))
             .agg(first("value_as_number", ignorenulls=True))
         )
         self.pivot_measures_desc = self.rename_columns(
-            self.pivot_measures_desc, {str(v): str("last_" + k) for k, v in self.measurements.items()}
+            self.pivot_measures_desc, {str(k): str("last_" + k) for k in self.measurements.keys()}
         )
             
         self.dataset = (
